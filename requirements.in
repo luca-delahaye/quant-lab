@@ -1,0 +1,10 @@
+# Direct dependencies, chosen by hand. Exact versions of everything live in requirements.txt,
+# regenerated with: pip freeze > requirements.txt
+
+# Runtime
+pandas
+numpy
+yfinance
+
+# Tests
+pytest
