@@ -26,7 +26,7 @@ def _check_prices(prices: pd.Series, positive_only: bool = False) -> None:
         raise PriceDataError(f"prices must be {limit}: {prices.index[bad][0].date()}")
 
 
-def _check_returns(returns: pd.Series) -> None:
+def check_returns(returns: pd.Series) -> None:
     """Refuse returns nothing can be accumulated from."""
     if returns.empty:
         raise ReturnsError("no returns")
@@ -54,7 +54,7 @@ def cumulative_from_simple(simple: pd.Series) -> pd.Series:
 
     Never sum simple returns: on 100 -> 110 -> 100 that gives +0.91% instead of 0.
     """
-    _check_returns(simple)
+    check_returns(simple)
     return (1 + simple).cumprod() - 1
 
 
@@ -63,5 +63,5 @@ def cumulative_from_log(log: pd.Series) -> pd.Series:
 
     Log returns add up over time, which is what makes this correct.
     """
-    _check_returns(log)
+    check_returns(log)
     return np.exp(log.cumsum()) - 1
