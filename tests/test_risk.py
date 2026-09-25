@@ -3,12 +3,20 @@ import math
 import pandas as pd
 import pytest
 
+from quantlab.data import PriceDataError
 from quantlab.returns import ReturnsError
-from quantlab.risk import TRADING_DAYS_PER_YEAR, annualized_volatility, daily_volatility
+from quantlab.risk import (
+    TRADING_DAYS_PER_YEAR,
+    annualized_volatility,
+    daily_volatility,
+    drawdown_series,
+    max_drawdown,
+)
 
 DATES = pd.DatetimeIndex(
     ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"], name="Date"
 )
+PRICE_DATES = DATES.append(pd.DatetimeIndex(["2024-01-08"], name="Date"))
 
 # +1%, -1%, +2%, -2%: mean 0, squared deviations 0.0001 + 0.0001 + 0.0004 + 0.0004.
 SQUARED_DEVIATIONS = 0.001
@@ -91,3 +99,75 @@ def test_nan_in_returns_raises(function):
     broken.iloc[1] = float("nan")
     with pytest.raises(ReturnsError):
         function(broken)
+
+
+# --- drawdown -----------------------------------------------------------------
+
+# 100 -> 120 -> 90 -> 110 -> 130, so the running peaks are 100, 120, 120, 120, 130.
+WORST_DRAWDOWN = -0.25  # 90 against a peak of 120
+PARTIAL_RECOVERY = -1 / 12  # 110 against a peak of 120
+
+
+def make_drawdown_prices():
+    """Five prices whose drawdowns can be computed by hand."""
+    return pd.Series(
+        [100.0, 120.0, 90.0, 110.0, 130.0], index=PRICE_DATES, name="Adj Close"
+    )
+
+
+def test_max_drawdown_on_hand_computed_prices():
+    assert max_drawdown(make_drawdown_prices()) == WORST_DRAWDOWN
+
+
+def test_rising_prices_have_no_drawdown():
+    """The August test: a series that only rises never falls from a peak."""
+    rising = pd.Series([100.0, 110.0, 120.0, 130.0, 140.0], index=PRICE_DATES)
+    assert max_drawdown(rising) == 0.0
+
+
+def test_halved_prices_give_minus_one_half():
+    halved = pd.Series([100.0, 50.0], index=PRICE_DATES[:2])
+    assert max_drawdown(halved) == -0.5
+
+
+def test_drawdown_is_scale_invariant():
+    """A drawdown is a ratio: multiplying every price by a constant changes nothing."""
+    prices = make_drawdown_prices()
+    assert max_drawdown(prices * 3) == pytest.approx(max_drawdown(prices))
+
+
+def test_drawdown_series_matches_the_prices():
+    expected = pd.Series(
+        [0.0, 0.0, WORST_DRAWDOWN, PARTIAL_RECOVERY, 0.0],
+        index=PRICE_DATES,
+        name="Adj Close",
+    )
+    pd.testing.assert_series_equal(drawdown_series(make_drawdown_prices()), expected)
+
+
+def test_drawdown_is_never_positive():
+    """Decision 4.4 as a fact: negative below a peak, exactly 0 at a new high."""
+    assert (drawdown_series(make_drawdown_prices()) <= 0).all()
+    assert max_drawdown(make_drawdown_prices()) <= 0
+
+
+def test_one_price_has_zero_drawdown():
+    """Unlike volatility, a single price is answerable: it is its own peak."""
+    one = make_drawdown_prices().iloc[:1]
+    assert max_drawdown(one) == 0.0
+    assert (drawdown_series(one) == 0.0).all()
+
+
+@pytest.mark.parametrize("function", [drawdown_series, max_drawdown])
+def test_empty_prices_raise(function):
+    with pytest.raises(PriceDataError):
+        function(make_drawdown_prices().iloc[0:0])
+
+
+@pytest.mark.parametrize("function", [drawdown_series, max_drawdown])
+@pytest.mark.parametrize("bad", [float("nan"), 0.0, -90.0])
+def test_bad_price_raises(function, bad):
+    prices = make_drawdown_prices()
+    prices.iloc[2] = bad
+    with pytest.raises(PriceDataError):
+        function(prices)

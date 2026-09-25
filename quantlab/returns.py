@@ -14,10 +14,14 @@ class ReturnsError(ValueError):
     """Returns that cannot be trusted: an empty series, or a missing value inside it."""
 
 
-def _check_prices(prices: pd.Series, positive_only: bool = False) -> None:
-    """Refuse prices no return can be computed from."""
-    if len(prices) < 2:
-        raise PriceDataError(f"at least 2 prices are needed, got {len(prices)}")
+def check_prices(
+    prices: pd.Series, min_length: int = 2, positive_only: bool = False
+) -> None:
+    """Refuse prices nothing can be computed from: min_length is 2 for returns, 1 for drawdown."""
+    if len(prices) < min_length:
+        raise PriceDataError(
+            f"at least {min_length} price(s) are needed, got {len(prices)}"
+        )
     if prices.isna().any():
         raise PriceDataError(f"missing price on {prices.index[prices.isna()][0].date()}")
     bad = prices <= 0 if positive_only else prices == 0
@@ -36,32 +40,23 @@ def check_returns(returns: pd.Series) -> None:
 
 def simple_returns(prices: pd.Series) -> pd.Series:
     """Simple returns, (today - yesterday) / yesterday, with the first date dropped."""
-    _check_prices(prices)
+    check_prices(prices)
     return (prices / prices.shift(1) - 1).iloc[1:]
 
 
 def log_returns(prices: pd.Series) -> pd.Series:
-    """Log returns, ln(today / yesterday), with the first date dropped.
-
-    Needs strictly positive prices: ln(0) is -inf and ln of a negative is undefined.
-    """
-    _check_prices(prices, positive_only=True)
+    """Log returns, ln(today / yesterday), with the first date dropped."""
+    check_prices(prices, positive_only=True)
     return np.log(prices).diff().iloc[1:]
 
 
 def cumulative_from_simple(simple: pd.Series) -> pd.Series:
-    """Running cumulative return from simple returns: prod(1 + r) - 1.
-
-    Never sum simple returns: on 100 -> 110 -> 100 that gives +0.91% instead of 0.
-    """
+    """Running cumulative return from simple returns: prod(1 + r) - 1."""
     check_returns(simple)
     return (1 + simple).cumprod() - 1
 
 
 def cumulative_from_log(log: pd.Series) -> pd.Series:
-    """Running cumulative return from log returns: exp(sum(l)) - 1.
-
-    Log returns add up over time, which is what makes this correct.
-    """
+    """Running cumulative return from log returns: exp(sum(l)) - 1."""
     check_returns(log)
     return np.exp(log.cumsum()) - 1
