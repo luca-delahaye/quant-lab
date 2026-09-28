@@ -1,6 +1,6 @@
 # quant-lab
 
-A small, tested risk toolkit for daily equity prices, built on 21 years of SPY (2005–2025). It fetches prices, refuses corrupted data, and computes returns, volatility and drawdown under assumed conventions.
+A small, tested risk toolkit for daily equity prices, built on 21 years of SPY (2005–2025). It fetches prices, refuses corrupted data, and computes returns, volatility and drawdown under conventions it states.
 
 This is a research tool, not a trading strategy. No signal is generated and nothing here is a claim about future returns.
 
