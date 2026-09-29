@@ -1,4 +1,5 @@
 import math
+from statistics import NormalDist
 
 import pandas as pd
 import pytest
@@ -6,11 +7,15 @@ import pytest
 from quantlab.data import PriceDataError
 from quantlab.returns import ReturnsError
 from quantlab.risk import (
+    DEFAULT_LEVEL,
     TRADING_DAYS_PER_YEAR,
     annualized_volatility,
     daily_volatility,
     drawdown_series,
+    expected_shortfall,
     max_drawdown,
+    var_historical,
+    var_normal,
 )
 
 DATES = pd.DatetimeIndex(
@@ -171,3 +176,90 @@ def test_bad_price_raises(function, bad):
     prices.iloc[2] = bad
     with pytest.raises(PriceDataError):
         function(prices)
+
+
+# --- VaR and Expected Shortfall -----------------------------------------------
+
+# 21 returns: two losses and nineteen gains. At 95% the quantile position is
+# 0.05 * (21 - 1) = 1, so "lower" lands on the second worst return.
+TAIL_WORST = -0.08
+TAIL_SECOND = -0.04
+VAR_95 = TAIL_SECOND
+ES_95 = (TAIL_WORST + TAIL_SECOND) / 2
+
+
+def make_tail_returns():
+    """Twenty-one returns whose 95% VaR and ES can be read off by hand."""
+    values = [TAIL_WORST, TAIL_SECOND] + [0.01] * 19
+    dates = pd.bdate_range("2024-01-01", periods=len(values), name="Date")
+    return pd.Series(values, index=dates, name="Adj Close")
+
+
+def test_var_historical_is_the_second_worst_return():
+    assert var_historical(make_tail_returns()) == VAR_95
+
+
+def test_var_historical_returns_an_observed_value():
+    """"lower" never interpolates, so the answer is a return that actually happened."""
+    returns = make_tail_returns()
+    assert var_historical(returns) in set(returns)
+
+
+def test_var_historical_ignores_order():
+    shuffled = make_tail_returns().sample(frac=1, random_state=0)
+    assert var_historical(shuffled) == VAR_95
+
+
+def test_expected_shortfall_averages_the_tail():
+    assert expected_shortfall(make_tail_returns()) == pytest.approx(ES_95)
+
+
+def test_expected_shortfall_is_at_least_as_bad_as_var():
+    returns = make_tail_returns()
+    assert expected_shortfall(returns) <= var_historical(returns)
+
+
+def test_default_level_is_95_percent():
+    assert DEFAULT_LEVEL == 0.95
+    returns = make_tail_returns()
+    assert var_historical(returns, level=0.95) == var_historical(returns)
+
+
+def test_var_normal_is_mean_plus_z_times_sigma():
+    returns = make_returns()  # the four-value volatility example, mean 0
+    z = NormalDist().inv_cdf(0.05)
+    assert var_normal(returns) == pytest.approx(z * SAMPLE_DAILY)
+
+
+def test_var_normal_needs_no_tail_observations():
+    """Parametric VaR rests on the mean and the std, so four returns are enough."""
+    assert var_normal(make_returns(), level=0.99) < 0
+
+
+@pytest.mark.parametrize("function", [var_historical, expected_shortfall])
+def test_an_empty_tail_raises(function):
+    """At 99%, 21 returns put nothing in the tail: 21 * 0.01 < 1."""
+    with pytest.raises(ReturnsError):
+        function(make_tail_returns(), level=0.99)
+
+
+@pytest.mark.parametrize("function", [var_historical, var_normal, expected_shortfall])
+@pytest.mark.parametrize("level", [0.05, 0.4, 0.0, 1.0, 1.5])
+def test_level_outside_the_allowed_range_raises(function, level):
+    """0.05 is the classic slip: it means 95% but asks for a gain."""
+    with pytest.raises(ReturnsError):
+        function(make_tail_returns(), level=level)
+
+
+@pytest.mark.parametrize("function", [var_historical, var_normal, expected_shortfall])
+def test_empty_returns_raise_for_tail_measures(function):
+    with pytest.raises(ReturnsError):
+        function(make_tail_returns().iloc[0:0])
+
+
+@pytest.mark.parametrize("function", [var_historical, var_normal, expected_shortfall])
+def test_nan_in_returns_raises_for_tail_measures(function):
+    broken = make_tail_returns()
+    broken.iloc[1] = float("nan")
+    with pytest.raises(ReturnsError):
+        function(broken)
