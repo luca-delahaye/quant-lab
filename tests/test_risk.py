@@ -9,11 +9,14 @@ from quantlab.returns import ReturnsError
 from quantlab.risk import (
     DEFAULT_LEVEL,
     TRADING_DAYS_PER_YEAR,
+    VAR_WINDOW,
     annualized_volatility,
+    backtest_var,
     daily_volatility,
     drawdown_series,
     expected_shortfall,
     max_drawdown,
+    rolling_var,
     var_historical,
     var_normal,
 )
@@ -263,3 +266,85 @@ def test_nan_in_returns_raises_for_tail_measures(function):
     broken.iloc[1] = float("nan")
     with pytest.raises(ReturnsError):
         function(broken)
+
+
+# --- backtesting the VaR ------------------------------------------------------
+
+SHORT_WINDOW = 20  # the smallest window a 95% level allows
+
+
+def as_returns(values):
+    dates = pd.bdate_range("2024-01-01", periods=len(values), name="Date")
+    return pd.Series(values, index=dates, name="Adj Close")
+
+
+def make_backtest_returns():
+    """Twenty days of history, then three tested days of which two breach."""
+    return as_returns([-0.08, -0.04] + [0.01] * 18 + [-0.09, 0.02, -0.20])
+
+
+def test_rolling_var_is_as_long_as_the_returns():
+    returns = make_backtest_returns()
+    result = rolling_var(returns, window=SHORT_WINDOW)
+    assert len(result) == len(returns)
+    assert result.iloc[:SHORT_WINDOW].isna().all()
+    assert result.iloc[SHORT_WINDOW:].notna().all()
+
+
+def test_a_crash_does_not_inflate_its_own_var():
+    """Lookahead: the VaR for a day may only use returns up to the day before."""
+    calm = as_returns([0.01] * 19 + [-0.03])
+    crash = as_returns(list(calm) + [-0.50])
+    stated_on_the_crash_day = rolling_var(crash, window=SHORT_WINDOW).iloc[-1]
+    assert stated_on_the_crash_day == var_historical(calm)
+    assert crash.iloc[-1] <= stated_on_the_crash_day  # and so it counts as a breach
+
+
+def test_backtest_counts_breaches_out_of_sample():
+    result = backtest_var(make_backtest_returns(), window=SHORT_WINDOW)
+    assert result.days == 3
+    assert result.breaches == 2
+    assert result.expected == pytest.approx(3 * 0.05)
+    assert result.rate == pytest.approx(2 / 3)
+    assert result.window == SHORT_WINDOW
+    assert result.level == DEFAULT_LEVEL
+
+
+def test_a_return_equal_to_the_var_is_a_breach():
+    returns = as_returns([0.01] * 19 + [-0.05, -0.05])
+    result = backtest_var(returns, window=SHORT_WINDOW)
+    assert result.days == 1
+    assert result.breaches == 1
+
+
+def test_days_tested_is_the_returns_minus_the_window():
+    returns = make_tail_returns()  # 21 returns
+    assert backtest_var(returns, window=SHORT_WINDOW).days == len(returns) - SHORT_WINDOW
+
+
+def test_default_window_is_250():
+    assert VAR_WINDOW == 250
+
+
+@pytest.mark.parametrize("function", [rolling_var, backtest_var])
+def test_window_too_small_for_the_level_raises(function):
+    """At 99% a 20-day window puts nothing in the tail."""
+    with pytest.raises(ReturnsError):
+        function(make_backtest_returns(), window=SHORT_WINDOW, level=0.99)
+
+
+@pytest.mark.parametrize("function", [rolling_var, backtest_var])
+def test_window_longer_than_the_data_raises(function):
+    returns = make_backtest_returns()
+    with pytest.raises(ReturnsError):
+        function(returns, window=len(returns))
+
+
+@pytest.mark.parametrize("function", [rolling_var, backtest_var])
+def test_backtest_refuses_bad_returns(function):
+    broken = make_backtest_returns()
+    broken.iloc[5] = float("nan")
+    with pytest.raises(ReturnsError):
+        function(broken, window=SHORT_WINDOW)
+    with pytest.raises(ReturnsError):
+        function(broken.iloc[0:0], window=SHORT_WINDOW)
