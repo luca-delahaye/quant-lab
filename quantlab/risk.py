@@ -1,7 +1,7 @@
-"""Risk measures: volatility from returns, drawdown from prices.
+"""Risk measures: volatility and tail risk from returns, drawdown from prices.
 
-VaR and Expected Shortfall come in week 2. Conventions (4.3, 4.4, 4.5): sample
-standard deviation with ddof=1, annualized with sqrt(252), drawdown reported negative.
+Conventions (4.3, 4.4, 4.5, 4.7): sample standard deviation with ddof=1, annualized
+with sqrt(252), drawdown and VaR reported negative.
 """
 
 import math
@@ -19,6 +19,8 @@ MIN_RETURNS = 2  # ddof=1 divides by N - 1, so one return says nothing about spr
 DEFAULT_LEVEL = 0.95
 MIN_LEVEL = 0.5  # below this, level=0.05 for "95%" would silently ask for a gain.
 VAR_WINDOW = 250  # one trading year of history, the Basel convention.
+
+CHI2_95 = 3.841  # chi-square, 1 degree of freedom, 5% significance.
 
 
 def daily_volatility(returns: pd.Series) -> float:
@@ -130,3 +132,31 @@ def backtest_var(
         expected=days * (1 - level),
         rate=breaches / days,
     )
+
+
+class KupiecResult(NamedTuple):
+    """Verdict of Kupiec's proportion-of-failures test."""
+
+    statistic: float
+    critical: float
+    rejected: bool
+
+
+def kupiec_test(result: BacktestResult) -> KupiecResult:
+    """Whether the breach count is further from its promise than chance explains."""
+    n, x = result.days, result.breaches
+    p = 1 - result.level
+    if x == 0:
+        statistic = -2 * n * math.log(1 - p)
+    elif x == n:
+        statistic = -2 * n * math.log(p)
+    else:
+        rate = x / n
+        statistic = -2 * (
+            (n - x) * math.log(1 - p)
+            + x * math.log(p)
+            - (n - x) * math.log(1 - rate)
+            - x * math.log(rate)
+        )
+
+    return KupiecResult(statistic=statistic, critical=CHI2_95, rejected=statistic > CHI2_95)

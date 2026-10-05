@@ -7,11 +7,14 @@ import pytest
 from quantlab.data import PriceDataError
 from quantlab.returns import ReturnsError
 from quantlab.risk import (
+    CHI2_95,
     DEFAULT_LEVEL,
     TRADING_DAYS_PER_YEAR,
     VAR_WINDOW,
+    BacktestResult,
     annualized_volatility,
     backtest_var,
+    kupiec_test,
     daily_volatility,
     drawdown_series,
     expected_shortfall,
@@ -348,3 +351,77 @@ def test_backtest_refuses_bad_returns(function):
         function(broken, window=SHORT_WINDOW)
     with pytest.raises(ReturnsError):
         function(broken.iloc[0:0], window=SHORT_WINDOW)
+
+
+# --- Kupiec's test ------------------------------------------------------------
+
+
+def make_result(days, breaches, level=DEFAULT_LEVEL):
+    """A backtest outcome, without running a backtest to get it."""
+    return BacktestResult(
+        window=SHORT_WINDOW,
+        level=level,
+        days=days,
+        breaches=breaches,
+        expected=days * (1 - level),
+        rate=breaches / days,
+    )
+
+
+def test_a_perfectly_calibrated_model_scores_zero():
+    """5 breaches in 100 days is exactly what a 95% model promises."""
+    result = kupiec_test(make_result(days=100, breaches=5))
+    assert result.statistic == pytest.approx(0.0, abs=1e-12)
+    assert not result.rejected
+
+
+def test_twice_the_promised_breaches_is_rejected():
+    result = kupiec_test(make_result(days=100, breaches=10))
+    assert result.statistic == pytest.approx(4.1308, abs=1e-4)
+    assert result.rejected
+
+
+def test_no_breaches_at_all_is_still_a_number():
+    """0 * ln(0) is undefined as written; the limit gives -2 * N * ln(1 - p)."""
+    result = kupiec_test(make_result(days=100, breaches=0))
+    assert result.statistic == pytest.approx(-2 * 100 * math.log(0.95), abs=1e-9)
+    assert result.rejected  # a model that never breaches is miscalibrated too
+
+
+def test_every_day_breaching_is_still_a_number():
+    result = kupiec_test(make_result(days=100, breaches=100))
+    assert result.statistic == pytest.approx(-2 * 100 * math.log(0.05), abs=1e-9)
+    assert result.rejected
+
+
+def test_the_statistic_grows_with_the_miss():
+    base = kupiec_test(make_result(days=100, breaches=5)).statistic
+    near = kupiec_test(make_result(days=100, breaches=7)).statistic
+    far = kupiec_test(make_result(days=100, breaches=12)).statistic
+    assert base < near < far
+
+
+def test_critical_value_is_the_chi_square_threshold():
+    assert CHI2_95 == 3.841
+    assert kupiec_test(make_result(days=100, breaches=5)).critical == CHI2_95
+
+
+def test_rejection_follows_the_critical_value():
+    """Rejected exactly when the statistic exceeds 3.841, and not before."""
+    for breaches in range(5, 15):
+        result = kupiec_test(make_result(days=100, breaches=breaches))
+        assert result.rejected == (result.statistic > CHI2_95)
+
+
+def test_the_level_changes_the_verdict():
+    """10 breaches in 100 days is fine at 90%, and hopeless at 99%."""
+    assert not kupiec_test(make_result(days=100, breaches=10, level=0.90)).rejected
+    assert kupiec_test(make_result(days=100, breaches=10, level=0.99)).rejected
+
+
+def test_spy_sized_results_match_the_hand_computation():
+    """The Day 9 backtest: the 95% miss is noise, the 99% miss is not."""
+    assert kupiec_test(make_result(5032, 270, 0.95)).statistic == pytest.approx(1.38, abs=0.01)
+    assert not kupiec_test(make_result(5032, 270, 0.95)).rejected
+    assert kupiec_test(make_result(5032, 79, 0.99)).statistic == pytest.approx(14.07, abs=0.01)
+    assert kupiec_test(make_result(5032, 79, 0.99)).rejected
