@@ -28,18 +28,38 @@ A normal assumption is not uniformly optimistic, it is wrong in both directions 
 
 Real returns cluster closer to zero than a normal does, so at 95% the normal overstates the loss. Past roughly 97.5% it runs out of tail and understates it, badly: at 99.9% it says −3.7% where the data says −8.0%, and the worst day in the sample was −11.6%.
 
+## Does the VaR work?
+
+A VaR that is never tested is arithmetic, not a risk estimate. The backtest walks forward one day at a time: the VaR for each day is computed from the previous 250 days only, then compared with what actually happened. A breach is a day whose return fell at or below the VaR stated that morning.
+
+| Level | Days tested | Breaches | Expected | Rate | Kupiec LR | Verdict |
+|---|---|---|---|---|---|---|
+| 95% | 5,032 | 270 | 252 | 5.37% | 1.38 | not rejected |
+| 99% | 5,032 | 79 | 50 | 1.57% | 14.07 | **rejected** |
+
+**At 95% the model holds.** 270 breaches against 252 expected is within what chance explains: Kupiec's statistic is 1.38 against a threshold of 3.841, and it would take about 285 breaches to reject it.
+
+**At 99% it fails.** The VaR is breached 57% more often than it promises, and the statistic is nearly four times the threshold. One year of history does not contain enough extreme days to place a 99% threshold, so the estimate sits too close to the centre of the distribution. A longer window helps a little (1.51% over 500 days) but does not fix it; a heavier-tailed distribution or a volatility model would be the real answer.
+
+**And the breaches arrive together.** 29 of them fall in 2008 and 7 in 2017, which is 11.5% of days against 2.8%. Even a correct average rate hides that, and a risk limit cares about the clustering more than the average. Kupiec counts breaches but cannot see their timing; a test that can (Christoffersen's) is not implemented here.
+
+The three largest misses: 2020-03-16 came in 9.65 percentage points below the stated VaR, 2020-03-12 by 8.22, and 2008-10-15 by 7.61.
+
 ## Quickstart
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m pytest            # 93 tests, no network access
+python -m pytest            # 114 tests, no network access
 ```
 
 ```python
 from quantlab.data import load_adjusted
 from quantlab.returns import log_returns
-from quantlab.risk import annualized_volatility, expected_shortfall, max_drawdown, var_historical
+from quantlab.risk import (
+    annualized_volatility, backtest_var, expected_shortfall, kupiec_test,
+    max_drawdown, var_historical,
+)
 
 prices = load_adjusted()                        # the committed snapshot, validated
 returns = log_returns(prices)
@@ -48,6 +68,10 @@ annualized_volatility(returns)                  # 0.1907
 max_drawdown(prices)                            # -0.5519
 var_historical(returns, level=0.99)             # -0.0361
 expected_shortfall(returns)                     # -0.0298, at the default 95%
+
+result = backtest_var(returns)                  # walk forward with a 250-day window
+result.breaches, result.expected                # 270, 251.6
+kupiec_test(result).rejected                    # False at 95%, True at 99%
 ```
 
 `quantlab.data.fetch_and_save(force=True)` downloads a fresh snapshot. Nothing else touches the network, and the tests never do.
@@ -64,6 +88,7 @@ Every one of these changes the numbers, so each is a deliberate choice.
 | Annualization | Fixed 252 trading days, applied as √252 |
 | Drawdown | Reported negative; exactly 0 for a series that only rises |
 | VaR and ES | Reported negative, like any other return. A 95% VaR of −1.78% means 5% of days lose 1.78% or more; sources usually quote the same figure as a positive loss. |
+| Backtest | Walk-forward: the VaR for a day uses only the 250 days before it, so no day can inflate its own estimate. A return at or below the stated VaR counts as a breach. |
 | Percentile | The lower of the two neighbouring observations, never interpolated, so a VaR is always a return that actually happened |
 | Horizon | One day. Nothing here scales a VaR to ten days. |
 | Bad input | Refused. Only date order is corrected. |
@@ -104,6 +129,8 @@ A second figure sometimes quoted for SPY is 50.8%. That is reproducible here as 
 - **Close-to-close only.** Intraday extremes are not in the data, so drawdowns here are shallower than intraday figures. The index's intraday extremes even fall on different days than its closing ones: 1,576.09 on 2007-10-11 and 666.79 on 2009-03-06, a fall of 57.7%.
 - **A historical VaR rests on few observations.** At 99% over two years it is decided by about five days, so the figure moves a lot when the window changes. The code refuses a level whose tail would hold no observation at all, but it cannot make a thin tail reliable.
 - **A VaR estimated on the past describes the past.** It assumes the next day resembles the sample it was computed from, which crises are precisely the moments it does not.
+- **Kupiec counts breaches, not their timing.** A model can breach exactly 5% of the time and still fail, if every breach lands in the same month. That is what the 2008 figure above shows, and testing it properly needs Christoffersen's test, which is not implemented here.
+- **The data has to move.** A window of identical prices gives a VaR of 0 and reports every flat day as a breach. Not a concern for a liquid index fund, but it would matter for a halted stock or a fund with stale marks.
 
 ## Layout
 
@@ -111,8 +138,8 @@ A second figure sometimes quoted for SPY is 50.8%. That is reproducible here as 
 quantlab/
 ├── data.py       fetch, validate, load          no finance knowledge
 ├── returns.py    simple, log, cumulative        depends on data
-└── risk.py       volatility, drawdown, VaR, ES   depends on returns
-tests/            one test file per module, 93 tests, all offline
+└── risk.py       volatility, drawdown, VaR, ES, backtest   depends on returns
+tests/            one test file per module, 114 tests, all offline
 data/SPY.csv      the committed snapshot
 ```
 
