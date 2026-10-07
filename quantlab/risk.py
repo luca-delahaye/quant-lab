@@ -22,6 +22,9 @@ VAR_WINDOW = 250  # one trading year of history, the Basel convention.
 
 CHI2_95 = 3.841  # chi-square, 1 degree of freedom, 5% significance.
 
+EWMA_LAMBDA = 0.94  # RiskMetrics' daily decay: half the weight sits in the last 11 days.
+FHS_LOOKBACK = 500  # standardised returns used for the empirical quantile.
+
 
 def daily_volatility(returns: pd.Series) -> float:
     """Standard deviation of the returns, ddof=1 written out (4.3)."""
@@ -86,9 +89,9 @@ def expected_shortfall(returns: pd.Series, level: float = DEFAULT_LEVEL) -> floa
     return float(returns[returns <= threshold].mean())
 
 class BacktestResult(NamedTuple):
-    """Scorecard of a walk-forward VaR test."""
+    """Scorecard of a walk-forward VaR test; window is None for a recipe without one."""
 
-    window: int
+    window: int | None
     level: float
     days: int
     breaches: int
@@ -116,16 +119,21 @@ def rolling_var(
     return trailing.shift(1).rename("VaR")
 
 
-def backtest_var(
-    returns: pd.Series, window: int = VAR_WINDOW, level: float = DEFAULT_LEVEL
+def backtest_stated(
+    returns: pd.Series, stated: pd.Series, level: float = DEFAULT_LEVEL
 ) -> BacktestResult:
-    """Count the days whose return fell at or below the VaR stated that morning."""
-    stated = rolling_var(returns, window, level)
+    """Count the days whose return fell at or below a VaR stated by any recipe."""
+    check_returns(returns)
+    _check_level(level)
+    if not stated.index.equals(returns.index):
+        raise ReturnsError("the stated VaR must share the index of the returns")
     tested = stated.notna()
     days = int(tested.sum())
+    if days == 0:
+        raise ReturnsError("the stated VaR has no day to test")
     breaches = int((returns[tested] <= stated[tested]).sum())
     return BacktestResult(
-        window=window,
+        window=None,
         level=level,
         days=days,
         breaches=breaches,
@@ -134,12 +142,63 @@ def backtest_var(
     )
 
 
+def backtest_var(
+    returns: pd.Series, window: int = VAR_WINDOW, level: float = DEFAULT_LEVEL
+) -> BacktestResult:
+    """Backtest the rolling historical VaR, reporting the window it used."""
+    stated = rolling_var(returns, window, level)
+    return backtest_stated(returns, stated, level)._replace(window=window)
+
+
 class KupiecResult(NamedTuple):
     """Verdict of Kupiec's proportion-of-failures test."""
 
     statistic: float
     critical: float
     rejected: bool
+
+
+def _check_lambda(lam: float) -> None:
+    """Refuse a decay outside (0, 1]: lam = 0 would forget everything at once."""
+    if not 0 < lam <= 1:
+        raise ReturnsError(f"lam must be above 0 and at most 1, got {lam}")
+
+
+def ewma_volatility(
+    returns: pd.Series, lam: float = EWMA_LAMBDA, seed_window: int = VAR_WINDOW
+) -> pd.Series:
+    """Exponentially weighted daily volatility, stated each morning from prior days only."""
+    check_returns(returns)
+    _check_lambda(lam)
+    if seed_window < MIN_RETURNS:
+        raise ReturnsError(f"the seed needs at least {MIN_RETURNS} returns, got {seed_window}")
+    if seed_window >= len(returns):
+        raise ReturnsError(
+            f"a seed of {seed_window} needs more returns than that, got {len(returns)}"
+        )
+    values = returns.to_numpy()
+    stated = [float("nan")] * seed_window
+    variance = float(returns.iloc[:seed_window].var(ddof=1))
+    for i in range(seed_window, len(values)):
+        stated.append(math.sqrt(variance))
+        variance = lam * variance + (1 - lam) * values[i] ** 2
+    return pd.Series(stated, index=returns.index, name="EWMA sigma")
+
+
+def var_fhs(
+    returns: pd.Series,
+    level: float = DEFAULT_LEVEL,
+    lam: float = EWMA_LAMBDA,
+    lookback: int = FHS_LOOKBACK,
+    seed_window: int = VAR_WINDOW,
+) -> pd.Series:
+    """Filtered historical simulation: empirical quantile of standardised returns, rescaled."""
+    _check_level(level)
+    _check_tail(lookback, level)
+    sigma = ewma_volatility(returns, lam, seed_window)
+    standardised = returns / sigma
+    quantile = standardised.rolling(lookback).quantile(1 - level, interpolation="lower")
+    return (quantile.shift(1) * sigma).rename("FHS VaR")
 
 
 def kupiec_test(result: BacktestResult) -> KupiecResult:

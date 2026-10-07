@@ -9,12 +9,17 @@ from quantlab.returns import ReturnsError
 from quantlab.risk import (
     CHI2_95,
     DEFAULT_LEVEL,
+    EWMA_LAMBDA,
+    FHS_LOOKBACK,
     TRADING_DAYS_PER_YEAR,
     VAR_WINDOW,
     BacktestResult,
     annualized_volatility,
+    backtest_stated,
     backtest_var,
+    ewma_volatility,
     kupiec_test,
+    var_fhs,
     daily_volatility,
     drawdown_series,
     expected_shortfall,
@@ -425,3 +430,159 @@ def test_spy_sized_results_match_the_hand_computation():
     assert not kupiec_test(make_result(5032, 270, 0.95)).rejected
     assert kupiec_test(make_result(5032, 79, 0.99)).statistic == pytest.approx(14.07, abs=0.01)
     assert kupiec_test(make_result(5032, 79, 0.99)).rejected
+
+
+# --- EWMA volatility ----------------------------------------------------------
+
+SEED = 2  # a two-day seed, so the recursion can be checked by hand
+
+
+def test_ewma_is_as_long_as_the_returns():
+    returns = as_returns([0.02, -0.02, 0.10, 0.01])
+    result = ewma_volatility(returns, seed_window=SEED)
+    assert len(result) == len(returns)
+    assert result.iloc[:SEED].isna().all()
+    assert result.iloc[SEED:].notna().all()
+
+
+def test_ewma_seeds_on_the_sample_std_of_the_first_days():
+    """The first stated sigma is the sample std of the seed window: sqrt(0.0008)."""
+    returns = as_returns([0.02, -0.02, 0.10, 0.01])
+    result = ewma_volatility(returns, seed_window=SEED)
+    assert result.iloc[SEED] == pytest.approx(math.sqrt(0.0008))
+
+
+def test_ewma_follows_the_recursion():
+    """After a 10% day: sigma^2 = 0.94 * 0.0008 + 0.06 * 0.10^2."""
+    returns = as_returns([0.02, -0.02, 0.10, 0.01])
+    result = ewma_volatility(returns, seed_window=SEED)
+    expected = math.sqrt(0.94 * 0.0008 + 0.06 * 0.10**2)
+    assert result.iloc[SEED + 1] == pytest.approx(expected)
+    assert result.iloc[SEED + 1] > result.iloc[SEED]  # and a big day raises sigma
+
+
+def test_a_crash_does_not_raise_its_own_sigma():
+    """Lookahead: two series differing only on the last day state the same sigma for it."""
+    history = [0.01, -0.01, 0.01, -0.01]
+    mild = as_returns(history + [-0.001])
+    crash = as_returns(history + [-0.50])
+    assert ewma_volatility(crash, seed_window=SEED).iloc[-1] == pytest.approx(
+        ewma_volatility(mild, seed_window=SEED).iloc[-1]
+    )
+
+
+def test_lambda_one_never_forgets_the_seed():
+    """With lam = 1 the recursion ignores every new return, so sigma stays at the seed."""
+    returns = as_returns([0.02, -0.02, 0.10, -0.30, 0.01])
+    result = ewma_volatility(returns, lam=1.0, seed_window=SEED)
+    assert result.iloc[SEED:].nunique() == 1
+    assert result.iloc[-1] == pytest.approx(math.sqrt(0.0008))
+
+
+def test_default_lambda_is_the_riskmetrics_value():
+    assert EWMA_LAMBDA == 0.94
+    assert FHS_LOOKBACK == 500
+
+
+@pytest.mark.parametrize("lam", [-0.1, 0.0, 1.1])
+def test_lambda_outside_the_allowed_range_raises(lam):
+    with pytest.raises(ReturnsError):
+        ewma_volatility(as_returns([0.01] * 10), lam=lam, seed_window=SEED)
+
+
+# --- filtered historical simulation -------------------------------------------
+
+SHORT_LOOKBACK = 20
+
+
+def make_fhs_returns(tail=()):
+    """Enough days to seed the sigma and fill the standardised lookback."""
+    base = [0.01, -0.012, 0.008, -0.009, 0.011] * 10  # 50 varied days
+    return as_returns(base + list(tail))
+
+
+def test_fhs_is_nan_until_the_lookback_is_full():
+    returns = make_fhs_returns()
+    result = var_fhs(returns, lookback=SHORT_LOOKBACK, seed_window=SEED)
+    assert len(result) == len(returns)
+    first_valid = SEED + SHORT_LOOKBACK
+    assert result.iloc[:first_valid].isna().all()
+    assert result.iloc[first_valid:].notna().all()
+
+
+def test_fhs_is_negative_and_wider_at_a_higher_level():
+    """A 20-day lookback allows 90% and 95%, but not 99%, which needs 100."""
+    returns = make_fhs_returns()
+    at_90 = var_fhs(returns, level=0.90, lookback=SHORT_LOOKBACK, seed_window=SEED).iloc[-1]
+    at_95 = var_fhs(returns, level=0.95, lookback=SHORT_LOOKBACK, seed_window=SEED).iloc[-1]
+    assert at_90 < 0
+    assert at_95 <= at_90
+
+
+def test_fhs_scales_with_the_returns():
+    """Doubling every return doubles sigma and leaves the standardised returns alone."""
+    returns = make_fhs_returns()
+    once = var_fhs(returns, lookback=SHORT_LOOKBACK, seed_window=SEED).iloc[-1]
+    twice = var_fhs(returns * 2, lookback=SHORT_LOOKBACK, seed_window=SEED).iloc[-1]
+    assert twice == pytest.approx(2 * once)
+
+
+def test_a_crash_does_not_widen_its_own_fhs_var():
+    """Same history, different final day: the VaR stated for that day is identical."""
+    mild = make_fhs_returns(tail=[-0.001])
+    with_crash = make_fhs_returns(tail=[-0.50])
+    assert var_fhs(with_crash, lookback=SHORT_LOOKBACK, seed_window=SEED).iloc[-1] == (
+        pytest.approx(var_fhs(mild, lookback=SHORT_LOOKBACK, seed_window=SEED).iloc[-1])
+    )
+
+
+def test_fhs_refuses_a_lookback_too_small_for_the_level():
+    with pytest.raises(ReturnsError):
+        var_fhs(make_fhs_returns(), level=0.99, lookback=SHORT_LOOKBACK, seed_window=SEED)
+
+
+def test_fhs_refuses_a_bad_level():
+    with pytest.raises(ReturnsError):
+        var_fhs(make_fhs_returns(), level=0.05, lookback=SHORT_LOOKBACK, seed_window=SEED)
+
+
+# --- the backtest core, for any recipe ----------------------------------------
+
+
+def test_backtest_stated_counts_breaches_against_a_given_series():
+    returns = as_returns([0.01, -0.05, -0.02, -0.10, 0.03])
+    stated = pd.Series(
+        [float("nan"), -0.04, -0.04, -0.04, -0.04], index=returns.index, name="VaR"
+    )
+    result = backtest_stated(returns, stated)
+    assert result.days == 4
+    assert result.breaches == 2  # -0.05 and -0.10, not -0.02 or +0.03
+    assert result.window is None  # no window: the recipe was not window-based
+    assert result.level == DEFAULT_LEVEL
+
+
+def test_backtest_var_still_reports_its_window():
+    result = backtest_var(make_backtest_returns(), window=SHORT_WINDOW)
+    assert result.window == SHORT_WINDOW
+
+
+def test_backtest_stated_refuses_a_mismatched_index():
+    returns = as_returns([0.01, -0.05, -0.02])
+    stated = pd.Series([-0.04, -0.04, -0.04], index=pd.bdate_range("2030-01-01", periods=3))
+    with pytest.raises(ReturnsError):
+        backtest_stated(returns, stated)
+
+
+def test_backtest_stated_refuses_a_series_with_nothing_to_test():
+    returns = as_returns([0.01, -0.05, -0.02])
+    stated = pd.Series([float("nan")] * 3, index=returns.index)
+    with pytest.raises(ReturnsError):
+        backtest_stated(returns, stated)
+
+
+def test_fhs_can_be_backtested_through_the_core():
+    returns = make_fhs_returns()
+    stated = var_fhs(returns, lookback=SHORT_LOOKBACK, seed_window=SEED)
+    result = backtest_stated(returns, stated)
+    assert result.days == len(returns) - SEED - SHORT_LOOKBACK
+    assert 0 <= result.breaches <= result.days
