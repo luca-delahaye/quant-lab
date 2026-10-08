@@ -15,6 +15,8 @@ SPY, 2005-01-03 to 2025-12-31, 5,283 trading days, dividend-adjusted closes.
 | Max drawdown | −55.19% | closing peak 2007-10-09 → trough 2009-03-09 |
 | 95% VaR, one day | −1.78% | 5th percentile of the daily log returns |
 | 95% Expected Shortfall | −2.98% | average of the returns at or below the VaR |
+| Backtested 99% VaR | 1.57% breaches vs 1% promised, **rejected** | walk-forward, 250-day historical |
+| Same, filtered historical simulation | 0.97% breaches, **not rejected** | walk-forward, EWMA-standardised |
 
 Volatility is not a property of an asset but of a period: the same recipe gives 41.2% for 2008 alone and 6.7% for 2017. The same holds for the tail measures, more sharply still: the 95% VaR is −4.60% on 2008 alone and −0.50% on 2017.
 
@@ -39,26 +41,61 @@ A VaR that is never tested is arithmetic, not a risk estimate. The backtest walk
 
 **At 95% the model holds.** 270 breaches against 252 expected is within what chance explains: Kupiec's statistic is 1.38 against a threshold of 3.841, and it would take about 285 breaches to reject it.
 
-**At 99% it fails.** The VaR is breached 57% more often than it promises, and the statistic is nearly four times the threshold. One year of history does not contain enough extreme days to place a 99% threshold, so the estimate sits too close to the centre of the distribution. A longer window helps a little (1.51% over 500 days) but does not fix it; a heavier-tailed distribution or a volatility model would be the real answer.
+**At 99% it fails.** The VaR is breached 57% more often than it promises, and the statistic is nearly four times the threshold. One year of history does not contain enough extreme days to place a 99% threshold, so the estimate sits too close to the centre of the distribution. A longer window helps a little (1.51% over 500 days) but does not fix it.
+
+Two problems sit behind that failure, and they are separate. The 250-day window weights every day equally and then drops it entirely, so the estimate reacts late: on 2020-03-16 it stated −5.0% against an actual −11.6%, reached −8.1% only a week later, held that level for a year, then halved in three weeks of March 2021 as the crash days left the window, with nothing happening in the market at all. And a percentile of raw returns mixes calm days with crisis days as if they were drawn from the same distribution.
 
 **And the breaches arrive together.** 29 of them fall in 2008 and 7 in 2017, which is 11.5% of days against 2.8%. Even a correct average rate hides that, and a risk limit cares about the clustering more than the average. Kupiec counts breaches but cannot see their timing; a test that can (Christoffersen's) is not implemented here.
 
 The three largest misses: 2020-03-16 came in 9.65 percentage points below the stated VaR, 2020-03-12 by 8.22, and 2008-10-15 by 7.61.
+
+## A VaR that passes
+
+Filtered historical simulation fixes the timing and the shape separately, and nothing in it is new machinery.
+
+1. **Estimate volatility with memory.** EWMA: `σ²ₜ = λ·σ²ₜ₋₁ + (1 − λ)·r²ₜ₋₁`, with λ = 0.94. Half the weight sits in the last 11 days, and nothing is ever dropped. On this data the estimate ranges from 4.7% annualized in 2017 to 84.8% in 2008.
+2. **Standardise each past return by the volatility of its own day**, zᵢ = rᵢ / σᵢ. A −3% day in a calm month and a −3% day in a crisis are no longer treated as the same event.
+3. **Take the empirical percentile of those z values** over the last 500 days, then rescale by today's σ. No distribution is assumed anywhere.
+
+| Recipe | Level | Breaches | Days | Rate | Kupiec LR | Verdict |
+|---|---|---|---|---|---|---|
+| Historical, 250 days | 95% | 270 | 5,032 | 5.37% | 1.38 | not rejected |
+| **FHS** | 95% | 214 | 4,532 | **4.72%** | 0.75 | not rejected |
+| Historical, 250 days | 99% | 79 | 5,032 | 1.57% | 14.07 | rejected |
+| **FHS** | 99% | 44 | 4,532 | **0.97%** | **0.04** | **not rejected** |
+
+FHS is the only recipe tested here that passes at both levels. At 99% its breach rate is 0.97% against a promised 1%, a Kupiec statistic of 0.04 where the threshold is 3.841.
+
+**What was tried and rejected**, on the same 4,532 days, because a result is only meaningful next to the alternatives:
+
+| Recipe | 95% rate | 99% rate |
+|---|---|---|
+| Historical, 250 days | 5.12% ok | 1.46% rejected |
+| Historical, 500 days | 5.16% ok | 1.35% rejected |
+| Normal, flat 250-day window | 5.56% ok | 2.89% rejected |
+| EWMA + normal quantile | 5.91% rejected | 2.36% rejected |
+| EWMA + Student-t(5) | 6.53% rejected | 1.79% rejected |
+| EWMA + Student-t(4) | 6.99% rejected | 1.70% rejected |
+| **FHS** | **4.72% ok** | **0.97% ok** |
+
+EWMA alone is worse than the model it replaces: it fixes *when* risk is high but still scales the tail with a normal quantile. Student-t narrows the gap at 99% and makes 95% worse, because a unit-variance t is wider in the tail and narrower in the middle. Only standardising and then reading the empirical tail gets both.
+
+Clustering improves too, though no test here measures it formally: at 99%, FHS breaches 3 times in 2008 against 11 for the historical VaR.
 
 ## Quickstart
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m pytest            # 114 tests, no network access
+python -m pytest            # 134 tests, no network access
 ```
 
 ```python
 from quantlab.data import load_adjusted
 from quantlab.returns import log_returns
 from quantlab.risk import (
-    annualized_volatility, backtest_var, expected_shortfall, kupiec_test,
-    max_drawdown, var_historical,
+    annualized_volatility, backtest_stated, backtest_var, expected_shortfall,
+    kupiec_test, max_drawdown, var_fhs, var_historical,
 )
 
 prices = load_adjusted()                        # the committed snapshot, validated
@@ -72,7 +109,12 @@ expected_shortfall(returns)                     # -0.0298, at the default 95%
 result = backtest_var(returns)                  # walk forward with a 250-day window
 result.breaches, result.expected                # 270, 251.6
 kupiec_test(result).rejected                    # False at 95%, True at 99%
+
+stated = var_fhs(returns, level=0.99)           # filtered historical simulation
+kupiec_test(backtest_stated(returns, stated, level=0.99)).rejected   # False
 ```
+
+`backtest_stated` takes any series of stated VaRs, so a new recipe needs no new backtest.
 
 `quantlab.data.fetch_and_save(force=True)` downloads a fresh snapshot. Nothing else touches the network, and the tests never do.
 
@@ -89,6 +131,8 @@ Every one of these changes the numbers, so each is a deliberate choice.
 | Drawdown | Reported negative; exactly 0 for a series that only rises |
 | VaR and ES | Reported negative, like any other return. A 95% VaR of −1.78% means 5% of days lose 1.78% or more; sources usually quote the same figure as a positive loss. |
 | Backtest | Walk-forward: the VaR for a day uses only the 250 days before it, so no day can inflate its own estimate. A return at or below the stated VaR counts as a breach. |
+| EWMA | λ = 0.94, the RiskMetrics daily value. Seeded on the sample standard deviation of the first 250 returns, and stated from prior days only. |
+| FHS | 500 standardised returns for the empirical quantile, with the same `lower` rule as the plain historical VaR. |
 | Percentile | The lower of the two neighbouring observations, never interpolated, so a VaR is always a return that actually happened |
 | Horizon | One day. Nothing here scales a VaR to ten days. |
 | Bad input | Refused. Only date order is corrected. |
@@ -139,7 +183,7 @@ quantlab/
 ├── data.py       fetch, validate, load          no finance knowledge
 ├── returns.py    simple, log, cumulative        depends on data
 └── risk.py       volatility, drawdown, VaR, ES, backtest   depends on returns
-tests/            one test file per module, 114 tests, all offline
+tests/            one test file per module, 134 tests, all offline
 data/SPY.csv      the committed snapshot
 ```
 
