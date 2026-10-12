@@ -17,6 +17,8 @@ from quantlab.risk import (
     annualized_volatility,
     backtest_stated,
     backtest_var,
+    breach_series,
+    christoffersen_test,
     ewma_volatility,
     kupiec_test,
     var_fhs,
@@ -586,3 +588,136 @@ def test_fhs_can_be_backtested_through_the_core():
     result = backtest_stated(returns, stated)
     assert result.days == len(returns) - SEED - SHORT_LOOKBACK
     assert 0 <= result.breaches <= result.days
+
+
+# --- Christoffersen's independence test ---------------------------------------
+
+
+def as_breaches(flags):
+    dates = pd.bdate_range("2024-01-01", periods=len(flags), name="Date")
+    return pd.Series([bool(flag) for flag in flags], index=dates, dtype=bool, name="breach")
+
+
+def make_runs(singles, pairs, days, gap):
+    """Breach runs of length one and two, each after `gap` calm days, padded with calm days."""
+    flags = []
+    for run in [[1]] * singles + [[1, 1]] * pairs:
+        flags += [0] * gap + run
+    return as_breaches(flags + [0] * (days - len(flags)))
+
+
+CLUSTERED = [0] * 50 + [1] * 5 + [0] * 45  # five breaches in one week
+SPREAD = ([0] * 19 + [1]) * 5  # the same five, one every four weeks
+
+
+def test_breach_series_flags_each_tested_day():
+    returns = as_returns([0.01, -0.05, -0.02, -0.10, 0.03])
+    stated = pd.Series(
+        [float("nan"), -0.04, -0.04, -0.04, -0.04], index=returns.index, name="VaR"
+    )
+    flags = breach_series(returns, stated)
+    assert list(flags) == [True, False, True, False]
+    assert flags.index.equals(returns.index[1:])  # an untested day is dropped, not False
+
+
+def test_a_return_equal_to_the_stated_var_is_flagged():
+    returns = as_returns([0.01, -0.04])
+    stated = pd.Series([float("nan"), -0.04], index=returns.index)
+    assert list(breach_series(returns, stated)) == [True]
+
+
+def test_breach_series_agrees_with_the_backtest():
+    returns = make_backtest_returns()
+    stated = rolling_var(returns, window=SHORT_WINDOW)
+    flags = breach_series(returns, stated)
+    result = backtest_stated(returns, stated)
+    assert len(flags) == result.days
+    assert flags.sum() == result.breaches
+
+
+def test_breach_series_refuses_a_mismatched_index():
+    returns = as_returns([0.01, -0.05, -0.02])
+    stated = pd.Series([-0.04, -0.04, -0.04], index=pd.bdate_range("2030-01-01", periods=3))
+    with pytest.raises(ReturnsError):
+        breach_series(returns, stated)
+
+
+def test_breach_series_refuses_a_series_with_nothing_to_test():
+    returns = as_returns([0.01, -0.05, -0.02])
+    stated = pd.Series([float("nan")] * 3, index=returns.index)
+    with pytest.raises(ReturnsError):
+        breach_series(returns, stated)
+
+
+def test_christoffersen_matches_the_hand_computation():
+    """Transitions 00:4, 01:1, 10:1, 11:1, so pi = 2/7, pi0 = 1/5, pi1 = 1/2."""
+    flags = as_breaches([0, 0, 1, 1, 0, 0, 0, 0])
+    independent = 5 * math.log(5 / 7) + 2 * math.log(2 / 7)
+    markov = 4 * math.log(4 / 5) + math.log(1 / 5) + 2 * math.log(1 / 2)
+    assert christoffersen_test(flags).statistic == pytest.approx(-2 * (independent - markov))
+
+
+def test_a_breach_no_likelier_after_a_breach_scores_zero():
+    """Transitions 00:4, 01:2, 10:2, 11:1: a breach follows either kind of day 1/3 of the time."""
+    result = christoffersen_test(as_breaches([1, 1, 0, 0, 0, 1, 0, 0, 0, 1]))
+    assert result.statistic == pytest.approx(0)
+    assert not result.rejected
+
+
+def test_clustered_breaches_are_rejected():
+    result = christoffersen_test(as_breaches(CLUSTERED))
+    assert result.statistic == pytest.approx(23.52, abs=0.01)
+    assert result.rejected
+
+
+def test_spread_breaches_are_not_rejected():
+    result = christoffersen_test(as_breaches(SPREAD))
+    assert result.statistic == pytest.approx(0.42, abs=0.01)
+    assert not result.rejected
+
+
+def test_kupiec_cannot_see_what_christoffersen_sees():
+    """Same five breaches in 100 days: one Kupiec verdict, two different timings."""
+    clustered, spread = as_breaches(CLUSTERED), as_breaches(SPREAD)
+    assert clustered.sum() == spread.sum() == 5
+    assert not kupiec_test(make_result(100, 5)).rejected  # the only input Kupiec sees
+    assert christoffersen_test(clustered).rejected
+    assert not christoffersen_test(spread).rejected
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [[0] * 10, [1] * 10, [0] * 9 + [1]],
+    ids=["no breach", "every day", "only the last day"],
+)
+def test_a_transition_never_seen_contributes_nothing(flags):
+    """0 * ln(0) is taken as 0, as at Kupiec's ends: the answer exists, so no error."""
+    result = christoffersen_test(as_breaches(flags))
+    assert result.statistic == pytest.approx(0)
+    assert not result.rejected
+
+
+def test_christoffersen_critical_value_is_the_chi_square_threshold():
+    assert christoffersen_test(as_breaches(SPREAD)).critical == CHI2_95
+
+
+@pytest.mark.parametrize("flags", [[], [1]], ids=["empty", "one day"])
+def test_christoffersen_needs_at_least_one_transition(flags):
+    with pytest.raises(ReturnsError):
+        christoffersen_test(as_breaches(flags))
+
+
+def test_christoffersen_refuses_a_missing_day():
+    flags = pd.Series([False, None, True], index=pd.bdate_range("2024-01-01", periods=3))
+    with pytest.raises(ReturnsError):
+        christoffersen_test(flags)
+
+
+def test_spy_sized_sequences_match_the_hand_computation():
+    """Transition counts of the real SPY backtests, log returns 2005-2025."""
+    historical_95 = christoffersen_test(make_runs(196, 37, 5032, gap=20))
+    assert historical_95.statistic == pytest.approx(28.55, abs=0.01)
+    assert historical_95.rejected  # Kupiec passed it at 1.38
+    fhs_99 = christoffersen_test(make_runs(36, 4, 4532, gap=100))
+    assert fhs_99.statistic == pytest.approx(11.35, abs=0.01)
+    assert fhs_99.rejected  # Kupiec passed it at 0.04

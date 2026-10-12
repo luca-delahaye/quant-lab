@@ -119,19 +119,25 @@ def rolling_var(
     return trailing.shift(1).rename("VaR")
 
 
+def breach_series(returns: pd.Series, stated: pd.Series) -> pd.Series:
+    """One flag per tested day: True when the return fell at or below the stated VaR."""
+    check_returns(returns)
+    if not stated.index.equals(returns.index):
+        raise ReturnsError("the stated VaR must share the index of the returns")
+    tested = stated.notna()
+    if not tested.any():
+        raise ReturnsError("the stated VaR has no day to test")
+    return (returns[tested] <= stated[tested]).rename("breach")
+
+
 def backtest_stated(
     returns: pd.Series, stated: pd.Series, level: float = DEFAULT_LEVEL
 ) -> BacktestResult:
     """Count the days whose return fell at or below a VaR stated by any recipe."""
-    check_returns(returns)
     _check_level(level)
-    if not stated.index.equals(returns.index):
-        raise ReturnsError("the stated VaR must share the index of the returns")
-    tested = stated.notna()
-    days = int(tested.sum())
-    if days == 0:
-        raise ReturnsError("the stated VaR has no day to test")
-    breaches = int((returns[tested] <= stated[tested]).sum())
+    flags = breach_series(returns, stated)
+    days = len(flags)
+    breaches = int(flags.sum())
     return BacktestResult(
         window=None,
         level=level,
@@ -219,3 +225,46 @@ def kupiec_test(result: BacktestResult) -> KupiecResult:
         )
 
     return KupiecResult(statistic=statistic, critical=CHI2_95, rejected=statistic > CHI2_95)
+
+
+class ChristoffersenResult(NamedTuple):
+    """Verdict of Christoffersen's independence test."""
+
+    statistic: float
+    critical: float
+    rejected: bool
+
+
+def _count_log(count: int, probability: float) -> float:
+    """count * ln(probability), taken as 0 when the count is 0, even if probability is 0."""
+    return 0.0 if count == 0 else count * math.log(probability)
+
+
+def christoffersen_test(breaches: pd.Series) -> ChristoffersenResult:
+    """Whether a breach makes the next one likelier than a calm day does."""
+    if breaches.isna().any():
+        raise ReturnsError("the breach series has a missing day")
+    if len(breaches) < 2:
+        raise ReturnsError(f"the test needs at least 2 days, got {len(breaches)}")
+    flags = breaches.astype(bool).to_numpy()
+    before, after = flags[:-1], flags[1:]
+    n00 = int((~before & ~after).sum())
+    n01 = int((~before & after).sum())
+    n10 = int((before & ~after).sum())
+    n11 = int((before & after).sum())
+
+    pi = (n01 + n11) / (n00 + n01 + n10 + n11)
+    pi0 = n01 / (n00 + n01) if n00 + n01 else 0.0  # breach after a calm day
+    pi1 = n11 / (n10 + n11) if n10 + n11 else 0.0  # breach after a breach
+    independent = _count_log(n00 + n10, 1 - pi) + _count_log(n01 + n11, pi)
+    markov = (
+        _count_log(n00, 1 - pi0)
+        + _count_log(n01, pi0)
+        + _count_log(n10, 1 - pi1)
+        + _count_log(n11, pi1)
+    )
+    statistic = -2 * (independent - markov)
+
+    return ChristoffersenResult(
+        statistic=statistic, critical=CHI2_95, rejected=statistic > CHI2_95
+    )
