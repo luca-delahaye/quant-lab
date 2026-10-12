@@ -16,7 +16,8 @@ SPY, 2005-01-03 to 2025-12-31, 5,283 trading days, dividend-adjusted closes.
 | 95% VaR, one day | −1.78% | 5th percentile of the daily log returns |
 | 95% Expected Shortfall | −2.98% | average of the returns at or below the VaR |
 | Backtested 99% VaR | 1.57% breaches vs 1% promised, **rejected** | walk-forward, 250-day historical |
-| Same, filtered historical simulation | 0.97% breaches, **not rejected** | walk-forward, EWMA-standardised |
+| Same, filtered historical simulation | 0.97% breaches, **not rejected** on rate | walk-forward, EWMA-standardised |
+| Same, tested for clustering | **rejected** on timing | Christoffersen independence test |
 
 Volatility is not a property of an asset but of a period: the same recipe gives 41.2% for 2008 alone and 6.7% for 2017. The same holds for the tail measures, more sharply still: the 95% VaR is −4.60% on 2008 alone and −0.50% on 2017.
 
@@ -45,7 +46,7 @@ A VaR that is never tested is arithmetic, not a risk estimate. The backtest walk
 
 Two problems sit behind that failure, and they are separate. The 250-day window weights every day equally and then drops it entirely, so the estimate reacts late: on 2020-03-16 it stated −5.0% against an actual −11.6%, reached −8.1% only a week later, held that level for a year, then halved in three weeks of March 2021 as the crash days left the window, with nothing happening in the market at all. And a percentile of raw returns mixes calm days with crisis days as if they were drawn from the same distribution.
 
-**And the breaches arrive together.** 29 of them fall in 2008 and 7 in 2017, which is 11.5% of days against 2.8%. Even a correct average rate hides that, and a risk limit cares about the clustering more than the average. Kupiec counts breaches but cannot see their timing; a test that can (Christoffersen's) is not implemented here.
+**And the breaches arrive together.** 29 of them fall in 2008 and 7 in 2017, which is 11.5% of days against 2.8%. Even a correct average rate hides that, and a risk limit cares about the clustering more than the average. Kupiec counts breaches but cannot see their timing; Christoffersen's test, below, can.
 
 The three largest misses: 2020-03-16 came in 9.65 percentage points below the stated VaR, 2020-03-12 by 8.22, and 2008-10-15 by 7.61.
 
@@ -64,7 +65,7 @@ Filtered historical simulation fixes the timing and the shape separately, and no
 | Historical, 250 days | 99% | 79 | 5,032 | 1.57% | 14.07 | rejected |
 | **FHS** | 99% | 44 | 4,532 | **0.97%** | **0.04** | **not rejected** |
 
-FHS is the only recipe tested here that passes at both levels. At 99% its breach rate is 0.97% against a promised 1%, a Kupiec statistic of 0.04 where the threshold is 3.841.
+FHS is the only recipe tested here whose breach *rate* passes at both levels. At 99% it is 0.97% against a promised 1%, a Kupiec statistic of 0.04 where the threshold is 3.841. Whether the breaches are also independent is a separate question, answered below, and at 99% the answer is no.
 
 **What was tried and rejected**, on the same 4,532 days, because a result is only meaningful next to the alternatives:
 
@@ -80,22 +81,42 @@ FHS is the only recipe tested here that passes at both levels. At 99% its breach
 
 EWMA alone is worse than the model it replaces: it fixes *when* risk is high but still scales the tail with a normal quantile. Student-t narrows the gap at 99% and makes 95% worse, because a unit-variance t is wider in the tail and narrower in the middle. Only standardising and then reading the empirical tail gets both.
 
-Clustering improves too, though no test here measures it formally: at 99%, FHS breaches 3 times in 2008 against 11 for the historical VaR.
+## Do the breaches cluster?
+
+A correct rate is not enough. Five breaches in a hundred days is exactly what a 95% VaR promises, whether they fall one every four weeks or all in the same week, and Kupiec scores both identically. A risk limit does not: five losses in a row is a different event from five scattered ones.
+
+Christoffersen's independence test looks at consecutive days. It counts how often a breach follows a calm day (π₀) and how often it follows another breach (π₁). If the model has absorbed the current level of risk, yesterday's breach should tell you nothing about today, and the two are equal. The statistic is a likelihood ratio, compared with the same chi-square threshold of 3.841.
+
+| Recipe | Level | After a calm day | After a breach | Christoffersen LR | Verdict |
+|---|---|---|---|---|---|
+| Historical, 250 days | 95% | 4.89% | 13.70% | 28.55 | **rejected** |
+| **FHS** | 95% | 4.70% | 5.14% | 0.08 | not rejected |
+| Historical, 250 days | 99% | 1.43% | 10.13% | 17.52 | **rejected** |
+| **FHS** | 99% | 0.89% | 9.09% | 11.35 | **rejected** |
+
+**The historical VaR at 95% passes Kupiec and fails here.** Its rate is right, but a breach nearly triples the chance of another the next day. The 250-day window has not yet noticed that the market changed.
+
+**FHS removes that at 95% entirely**: a breach is followed by another 5.14% of the time, against 4.70% after a calm day, which is chance.
+
+**At 99% it does not.** 4 of its 44 breaches come the day after another, so once a breach has happened the next day breaches about one time in eleven instead of one in a hundred. EWMA volatility reacts within days, but not within one: on the second day of a crash σ has only partly caught up. FHS fixes the rate at 99%, not the timing.
+
+The 99% verdict rests on four pairs of consecutive breaches, so it is fragile: with two pairs fewer the statistic falls to 3.14 and it would no longer be rejected. The chi-square threshold is also an approximation that is loose with counts this small. The direction is clear; the exact statistic is not.
 
 ## Quickstart
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m pytest            # 134 tests, no network access
+python -m pytest            # 152 tests, no network access
 ```
 
 ```python
 from quantlab.data import load_adjusted
 from quantlab.returns import log_returns
 from quantlab.risk import (
-    annualized_volatility, backtest_stated, backtest_var, expected_shortfall,
-    kupiec_test, max_drawdown, var_fhs, var_historical,
+    annualized_volatility, backtest_stated, backtest_var, breach_series,
+    christoffersen_test, expected_shortfall, kupiec_test, max_drawdown,
+    var_fhs, var_historical,
 )
 
 prices = load_adjusted()                        # the committed snapshot, validated
@@ -112,6 +133,7 @@ kupiec_test(result).rejected                    # False at 95%, True at 99%
 
 stated = var_fhs(returns, level=0.99)           # filtered historical simulation
 kupiec_test(backtest_stated(returns, stated, level=0.99)).rejected   # False
+christoffersen_test(breach_series(returns, stated)).rejected         # True
 ```
 
 `backtest_stated` takes any series of stated VaRs, so a new recipe needs no new backtest.
@@ -131,6 +153,7 @@ Every one of these changes the numbers, so each is a deliberate choice.
 | Drawdown | Reported negative; exactly 0 for a series that only rises |
 | VaR and ES | Reported negative, like any other return. A 95% VaR of −1.78% means 5% of days lose 1.78% or more; sources usually quote the same figure as a positive loss. |
 | Backtest | Walk-forward: the VaR for a day uses only the 250 days before it, so no day can inflate its own estimate. A return at or below the stated VaR counts as a breach. |
+| Independence | Christoffersen's test on consecutive days, at 5% significance. A transition that never occurs contributes nothing (0 · ln 0 = 0), so no breaches or all breaches give 0, not an error. |
 | EWMA | λ = 0.94, the RiskMetrics daily value. Seeded on the sample standard deviation of the first 250 returns, and stated from prior days only. |
 | FHS | 500 standardised returns for the empirical quantile, with the same `lower` rule as the plain historical VaR. |
 | Percentile | The lower of the two neighbouring observations, never interpolated, so a VaR is always a return that actually happened |
@@ -173,7 +196,7 @@ A second figure sometimes quoted for SPY is 50.8%. That is reproducible here as 
 - **Close-to-close only.** Intraday extremes are not in the data, so drawdowns here are shallower than intraday figures. The index's intraday extremes even fall on different days than its closing ones: 1,576.09 on 2007-10-11 and 666.79 on 2009-03-06, a fall of 57.7%.
 - **A historical VaR rests on few observations.** At 99% over two years it is decided by about five days, so the figure moves a lot when the window changes. The code refuses a level whose tail would hold no observation at all, but it cannot make a thin tail reliable.
 - **A VaR estimated on the past describes the past.** It assumes the next day resembles the sample it was computed from, which crises are precisely the moments it does not.
-- **Kupiec counts breaches, not their timing.** A model can breach exactly 5% of the time and still fail, if every breach lands in the same month. That is what the 2008 figure above shows, and testing it properly needs Christoffersen's test, which is not implemented here.
+- **Christoffersen only looks one day back.** It tests whether a breach makes the next day's breach likelier, not whether breaches pile up over a week or a month. Five breaches on alternate days of the same fortnight, out of 100 days, score 0.53 and pass. The joint test of rate and timing (conditional coverage, chi-square with two degrees of freedom) is not implemented.
 - **The data has to move.** A window of identical prices gives a VaR of 0 and reports every flat day as a breach. Not a concern for a liquid index fund, but it would matter for a halted stock or a fund with stale marks.
 
 ## Layout
@@ -183,7 +206,7 @@ quantlab/
 ├── data.py       fetch, validate, load          no finance knowledge
 ├── returns.py    simple, log, cumulative        depends on data
 └── risk.py       volatility, drawdown, VaR, ES, backtest   depends on returns
-tests/            one test file per module, 134 tests, all offline
+tests/            one test file per module, 152 tests, all offline
 data/SPY.csv      the committed snapshot
 ```
 
